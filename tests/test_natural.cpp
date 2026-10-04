@@ -14,10 +14,9 @@
 //	* the square (sqr / _sqr_base / _sqr_NTT) must agree with a * a;
 //	* the wrap-corrected "one size shorter" product must agree with ntt_wrap_enable
 //	  turned off, over the sawtooth band where the planner prefers it;
-//	* the NTT schedule plan must tile layers 2^(k-2)..2^1 exactly (one unpaired
-//	  distance-2 layer only when k is odd), and a product driven at an explicit scale
-//	  must equal the base case for every shape of the plan (DRAM alone .. all four
-//	  levels, even and odd scales);
+//	* the NTT schedule plan must tile layers 2^(k-2)..2^1 exactly (one pass per layer),
+//	  and a product driven at an explicit scale must equal the base case for every shape
+//	  of the plan (DRAM alone .. all four levels);
 //	* division must invert multiplication: (a/b)*b + a%b == a, (a*b)/b == a, and the
 //	  division regression group pins the short-divisor / short-quotient cases (the old
 //	  reciprocal() spin's reproducer, the whole measured family, both dispatch boundaries
@@ -195,19 +194,16 @@ static void t_sqr() {
 }
 
 // Structural invariants of the schedule itself: the levels must tile the layers
-// 2^(k-2) .. 2^1 exactly once, in decreasing distance order, each level's top layer must
-// fit that level's chunk (a 2^T chunk holds layers j <= T-1), and the single unpaired layer
-// the schedule may leave -- only when k is odd -- must be the distance-2 layer of the last
-// non-empty level, which keeps the forward and inverse level runners mirror images.
+// 2^(k-2) .. 2^1 exactly once, in decreasing distance order, and each level's top layer
+// must fit that level's chunk (a 2^T chunk holds layers j <= T-1).  With one pass per
+// layer there is no parity constraint on a level's layer count.
 static void t_sched_plan() {
 	group("schedule plan (ntt_sched_for)");
 	for (int k = 2; k <= 24; k++) {
 		const ntt_sched S = ntt_sched_for(k);
 		bool chunk_ok = S.nlevel >= 1 && S.nlevel <= ntt_sched::MAXLEVEL && S.chunk[0] == k;
-		bool fits = true, tiling = true, shape = true, lone_ok = true;
-		int layers = 0, lones = 0, last = 0;
-		for (int i = 0; i < S.nlevel; i++)
-			if (S.lv[i].hi >= S.lv[i].lo) last = i;      // last non-empty level
+		bool fits = true, tiling = true, range_ok = true;
+		int layers = 0;
 		for (int i = 0; i < S.nlevel; i++) {
 			const ntt_level& lv = S.lv[i];
 			if (i) {
@@ -218,19 +214,15 @@ static void t_sched_plan() {
 			if (count <= 0)
 				continue;
 			if (lv.hi > S.chunk[i] - 1) fits = false;
-			if (lv.pairs != count / 2 || lv.lone != ((count & 1) != 0)) shape = false;
-			if (lv.lone && (lv.lo != 1 || i != last)) lone_ok = false;
-			if (lv.lone) lones++;
+			if (lv.lo < 1 || lv.hi > k - 2) range_ok = false;
 			layers += count;
 		}
 		if (S.lv[S.nlevel - 1].lo != 1) tiling = false;
 		check(chunk_ok, "chunks: k first, then strictly decreasing, at most MAXLEVEL levels");
 		check(fits, "every level layer fits that level's chunk (j <= T-1)");
 		check(tiling, "levels tile layers 1..k-2 with no gap");
-		check(shape, "pairs / lone match the layer count of the level");
+		check(range_ok, "every non-empty level stays within layers 1..k-2");
 		check(layers == k - 2, "every scheduled layer is covered exactly once");
-		check(lone_ok && lones == ((k & 1) ? 1 : 0),
-			"one unpaired layer iff k is odd, and it is the distance-2 layer");
 	}
 	done();
 }
@@ -238,8 +230,7 @@ static void t_sched_plan() {
 // End to end across the whole schedule: the product of two operands, driven through
 // ntt()/intt() at an explicit scale, must equal the Toom-22 base case.  The operands stay
 // small enough for the base case to be cheap while the explicit scale sweeps the shapes of
-// the plan -- DRAM alone at small scales, DRAM+L3+L2+L1 at the largest ones -- including
-// the odd scales, where the distance-2 layer is left unpaired.
+// the plan -- DRAM alone at small scales, DRAM+L3+L2+L1 at the largest ones.
 static void t_sched_scales() {
 	group("schedule: product vs base at explicit scales");
 	for (int k = 10; k <= 22; k++) {

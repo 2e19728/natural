@@ -84,12 +84,12 @@ g++ -O3 -march=native -std=c++20 -masm=intel -Iinclude \
 * **DRAM / L3 / L2 / L1 schedule.** The scheduled layers are run level by level, chunk-major,
   one level per memory level: the whole array (DRAM), then `2^20`-element chunks (8 MiB, one
   modulus at a time, under the 24 MiB L3), `2^16` (512 KiB, L2) and `2^12` (32 KiB, L1). Each
-  level merges two
-  layers per pass (radix-4) with positionally computed twiddle cursors, and the cut points
-  are clamped to the array size and de-duplicated per transform, so a small scale simply has
-  fewer levels. Boundaries are parity aligned, so the only unpaired layer a level can leave is
-  the distance-2 layer, run last forward and first inverse (the minimum-distance end in both
-  directions). The three edge passes are *fused* into passes that were already touching the
+  level is a plain range of layers,
+  **one pass per layer**, with the twiddle cursor derived positionally from the block base
+  (`base >> j`); the cut points are clamped to the array size and de-duplicated per transform,
+  so a small scale simply has fewer levels. Layers run descending (largest distance first)
+  forward and ascending inverse, so the forward and inverse level runners stay mirror images
+  of each other. The three edge passes are *fused* into passes that were already touching the
   data (fold in `load()`, last forward layer + pointwise + first inverse layer in
   `nat_asmNttMul`, last inverse layer + the final shift in `intt_shr`).
 * **One size shorter.** Just above a power of two the transform would be half empty; instead

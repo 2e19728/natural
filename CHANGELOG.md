@@ -16,9 +16,13 @@ All notable changes to this project are documented here.  The format follows
   single-layer loop and the two-level schedule they selected: every scale now runs the same
   code.  The runtime tunables `ntt_sched_la` / `ntt_sched_lb` and
   `ntt_workspace::sched_levels()` are gone too; the cut points can still be scanned from the
-  command line (`-Dntt_scale_l2_threshold=14`).  Level boundaries are parity aligned, so the
-  only unpaired layer the schedule can leave is the distance-2 layer, always run at the
-  minimum-distance end of both the forward and the inverse order.
+  command line (`-Dntt_scale_l2_threshold=14`).  Each level is a plain range of layers and runs
+  **one pass per layer** (descending forward, ascending inverse), so the two directions stay
+  mirror images of each other without any pairing rule.
+- The engine is radix-2 only.  The radix-4 merged-pass kernels (`nat_asmNtt_radix4`,
+  `nat_asmNtt2_radix4`, `nat_asmINtt_radix4`, `nat_asmINtt2_radix4`, 415 lines) are removed
+  from `src/mul_ntt.s`, and the parity-aligned pairing rule they required is gone with them.
+  The radix-2 schedule is the engine every published throughput number was measured on.
 
 ### Fixed
 - Division could spin forever on a two-limb divisor whose top limb is 1 (`(2^192-1)/(2^64+1)`

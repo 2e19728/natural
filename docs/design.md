@@ -49,19 +49,17 @@ drive the schedule:
 So the scheduled layers are run one level per memory level, coarse to fine: DRAM (the whole
 array), then the L3 / L2 / L1 working sets — `2^20`-element chunks (8 MiB), `2^16` (512 KiB)
 and `2^12` (32 KiB), one modulus at a time under the 24 MiB L3 / 1.25 MiB L2 / 48 KiB L1d.
-Each level merges two layers per pass
-(radix-4) and derives its two table cursors from `base`, and inside a level the layers are run
-chunk-major — every layer of the level over one chunk before moving on — so the chunk stays
+Each level is a plain range of layers,
+one pass per layer, and every pass derives its twiddle cursor from the block base, and inside
+a level the layers are run chunk-major — every layer of the level over one chunk before moving on — so the chunk stays
 resident across the whole level and the level streams the array once. The cut points are the
 `ntt_scale_l1/l2/l3_threshold` constants, clamped to the array size and de-duplicated, so a
 scale too small to fill a level simply has fewer levels (below `l1`, all four collapse into a
 single DRAM pass).
 
-Level boundaries are parity aligned, which makes every level an even number of layers except
-possibly the finest one; the unpaired layer, when it exists, is always the distance-2 layer,
-and it is run last in the forward order and first in the inverse order — the position the
-layer order gives the smallest distance anyway. Because it is always the same layer, the
-forward and the inverse level runners remain mirror images of each other.
+Within a level the layers run descending (largest distance first) forward and ascending
+inverse, which makes the forward and the inverse level runners mirror images of each other
+without any special case for the finest level.
 
 The three "edge" passes of the transform are not paid for separately; they are fused into
 passes that already touch the data:

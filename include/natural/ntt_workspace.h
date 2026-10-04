@@ -24,13 +24,9 @@ extern "C" {
 
 	void nat_asmINtt2(uint64_t _N, uint64_t _Mod, uint64_t* _Begin, const uint64_t* _Root, uint64_t* _End);
 
-	void nat_asmNtt_radix4(uint64_t _D, uint64_t _Mod, uint64_t* _Begin, const uint64_t* _RootO, const uint64_t* _RootI, uint64_t* _End);
 
-	void nat_asmNtt2_radix4(uint64_t _D, uint64_t _Mod, uint64_t* _Begin, const uint64_t* _RootO, const uint64_t* _RootI, uint64_t* _End);
 
-	void nat_asmINtt_radix4(uint64_t _D, uint64_t _Mod, uint64_t* _Begin, const uint64_t* _RootO, const uint64_t* _RootI, uint64_t* _End);
 
-	void nat_asmINtt2_radix4(uint64_t _D, uint64_t _Mod, uint64_t* _Begin, const uint64_t* _RootO, const uint64_t* _RootI, uint64_t* _End);
 
 	// Fused last NTT layer x pointwise multiply x first INTT layer, for modulus _I
 	// (one generic function replacing the original asmNttMul0/1/2; see mul_ntt.s).
@@ -308,13 +304,10 @@ inline void ntt_workspace::load(const array_u64& n, int scale) {
 //  (2) the twiddle cursor is purely positional: a pass over [base, base+2^T) must
 //      start at table element 2*(base/2^(j+1)) = base>>j.  "Twiddle indexing" here
 //      means exactly this offset arithmetic -- plus the rule that the kernels that
-//      skip the block-0 multiply (nat_asmNtt, nat_asmNtt_radix4) are used iff base == 0.
+//      skip the block-0 multiply (nat_asmNtt) is used iff base == 0.
 //
-// A radix-4 macro-block of 4D elements covers two layers at once (2D then D on the
-// forward side, D then 2D on the inverse side) and drives two cursors,
-//      RootO = table + (base >> j)        for the layer at distance 2D = 2^j,
-//      RootI = table + (base >> (j-1))    for the layer at distance D = 2^(j-1),
-// so any range of layers can be run as merged passes at any level.
+// Every layer is its own pass: a pass at layer j over [base, base+2^T) reads its
+// twiddles from table element base>>j and writes the 2^j-pairs in place.
 //
 // The four levels of the memory hierarchy, coarse to fine: DRAM, L3, L2, L1.  Level T runs
 // the layers that fit a chunk of 2^T limbs, i.e. every layer j <= T-1: layer j is block
@@ -337,12 +330,8 @@ inline void ntt_workspace::load(const array_u64& n, int scale) {
 // fewer levels rather than empty ones: at scale k <= l1 all four collapse into DRAM and the
 // transform is a single chunk-major walk over the whole array.
 //
-// A level is a whole number of merged radix-4 pairs except possibly the finest one, which
-// can leave the distance-2 layer (j = 1) unpaired.  That is the only unpaired layer the
-// schedule can produce -- the level boundaries are parity aligned in ntt_sched_for to make
-// it so -- and ntt_fwd_sched/ntt_inv_sched run it last forward and first inverse: the
-// position the layer order gives the smallest distance anyway.  Because it is always the
-// same layer, the forward and inverse level runners stay mirror images of each other.
+// A level is a plain range of layers, one pass per layer, run descending forward and
+// ascending inverse; ntt_fwd_sched/ntt_inv_sched keep the two mirror images of each other.
 //
 // What is deliberately *not* here: the classic four-step / six-step FFT, i.e.
 // interpreting the array as an N1 x N2 matrix, running N1 transforms of length N2,
@@ -384,12 +373,10 @@ inline constexpr int ntt_scale_l3_threshold = 20;
 #endif
 
 // One level of the schedule: the layer range [lo, hi] (layer j = distance 2^j, run
-// descending forward and ascending inverse) plus the shape of its merged passes.
-// hi < lo means the level is empty.
+// descending forward and ascending inverse), one pass per layer.  hi < lo means the
+// level is empty.
 struct ntt_level {
 	int lo, hi;    // lowest and highest layer of the level
-	int pairs;     // merged radix-4 passes: one per two layers
-	bool lone;     // odd number of layers: one unpaired distance-2^lo radix-2 pass
 };
 
 // The schedule of one transform: at most four levels, DRAM, L3, L2 and L1.  chunk[0] is
@@ -405,10 +392,7 @@ struct ntt_sched {
 // Schedules layers 2^(k-2) .. 2^1 -- the 2^(k-1) fold is fused into load() and the 2^0
 // layer into nat_asmNttMul.  Cut points are the cache thresholds, clamped to the array (a
 // threshold above k adds nothing) and de-duplicated (several clamping to the same value
-// collapse into one level).  The boundaries are then parity aligned to k-1, so every level
-// holds an even number of layers except possibly the last, whose range ends at 1: the only
-// unpaired layer the schedule can produce is the distance-2 layer j = 1.  Dropping a
-// boundary by one layer moves it into the next coarser level, where it costs nothing.
+// collapse into one level).
 inline ntt_sched ntt_sched_for(int k) {
 	ntt_sched S;
 	S.nlevel = 0;
@@ -423,16 +407,14 @@ inline ntt_sched ntt_sched_for(int k) {
 			continue;
 		S.chunk[S.nlevel++] = v;
 	}
-	const int parity = (k - 1) & 1;
 	int lim = k - 1;
 	int b[ntt_sched::MAXLEVEL];
-	// boundary b[i]: level i runs layers [b[i+1], b[i]-1], with b[0] = k-1.  Every boundary
-	// has the parity of k-1, which is what keeps the level lengths even except possibly the
-	// last one; a boundary lowered to reach that parity pushes one layer into the coarser
-	// level above it.
+	// boundary b[i]: level i runs layers [b[i+1], b[i]-1], with b[0] = k-1.  A boundary is
+	// clamped to its chunk -- layer j is block diagonal with respect to 2^(j+1)-element
+	// blocks, so it fits a 2^chunk chunk iff j <= chunk-1.  The clamp is what keeps
+	// lv.hi <= chunk-1; the block counts in ntt_*_sched use S.chunk[], not b[].
 	for (int i = 0; i < S.nlevel; i++) {
 		if (lim > S.chunk[i]) lim = S.chunk[i];
-		if ((lim & 1) != parity) lim--;
 		if (lim < 1) lim = 1;          // degenerate cut points can undershoot on tiny sizes
 		b[i] = lim;
 		lim--;
@@ -441,15 +423,11 @@ inline ntt_sched ntt_sched_for(int k) {
 		ntt_level& lv = S.lv[i];
 		lv.hi = b[i] - 1;                              // level i covers [b[i+1], b[i]-1]
 		lv.lo = (i + 1 < S.nlevel) ? b[i + 1] : 1;
-		const int count = lv.hi - lv.lo + 1;
-		lv.pairs = count > 0 ? count / 2 : 0;
-		lv.lone = count > 0 && (count & 1) != 0;
 	}
 	return S;
 }
 
-// One forward level over [base, base+2^span): lv.pairs merged radix-4 passes covering the
-// layer pairs (hi, hi-1), (hi-2, hi-3), .., then the unpaired bottom layer, if any, LAST.
+// One forward level over [base, base+2^span): one pass per layer, distances descending.
 // The twiddle cursor stays positional -- a pass at layer j over this chunk starts at
 // table element base>>j -- and the block-0 kernels are used iff base == 0.
 inline void ntt_fwd_level(uint64_t* _Data, uint64_t _Base, uint64_t _Span, const ntt_level& lv, int _I) {
@@ -459,24 +437,15 @@ inline void ntt_fwd_level(uint64_t* _Data, uint64_t _Base, uint64_t _Span, const
 	const uint64_t M = ntt_workspace::mods[_I];
 	uint64_t* B = _Data + _Base;
 	uint64_t* E = B + _Span;
-	for (int p = 0, j = lv.hi; p < lv.pairs; p++, j -= 2) {
-		const uint64_t D = 1ull << (j - 1);
-		const uint64_t* ro = R + (_Base >> j);
-		const uint64_t* ri = R + (_Base >> (j - 1));
-		if (_Base == 0) nat_asmNtt_radix4(D, M, B, ro, ri, E);
-		else nat_asmNtt2_radix4(D, M, B, ro, ri, E);
-	}
-	if (lv.lone) {
-		const uint64_t d = 1ull << lv.lo;
-		const uint64_t* r = R + (_Base >> lv.lo);
+	for (int j = lv.hi; j >= lv.lo; j--) {
+		const uint64_t d = 1ull << j;
+		const uint64_t* r = R + (_Base >> j);
 		if (_Base == 0) nat_asmNtt(d, M, B, r, E);
 		else nat_asmNtt2(d, M, B, r, E);
 	}
 }
 
-// Mirror of ntt_fwd_level.  nat_asmINtt_radix4(D,..) is layers D then 2D, so the merged
-// pairs of lv.pairs run ascending from the bottom of the range and the unpaired layer, if
-// any, goes FIRST.
+// Mirror of ntt_fwd_level: one pass per layer, distances ascending.
 inline void ntt_inv_level(uint64_t* _Data, uint64_t _Base, uint64_t _Span, const ntt_level& lv, int _I) {
 	if (lv.hi < lv.lo)
 		return;
@@ -484,20 +453,11 @@ inline void ntt_inv_level(uint64_t* _Data, uint64_t _Base, uint64_t _Span, const
 	const uint64_t M = ntt_workspace::mods[_I];
 	uint64_t* B = _Data + _Base;
 	uint64_t* E = B + _Span;
-	int j = lv.lo;
-	if (lv.lone) {
+	for (int j = lv.lo; j <= lv.hi; j++) {
 		const uint64_t d = 1ull << j;
 		const uint64_t* r = R + (_Base >> j);
 		if (_Base == 0) nat_asmINtt(d, M, B, r, E);
 		else nat_asmINtt2(d, M, B, r, E);
-		j++;
-	}
-	for (int p = 0; p < lv.pairs; p++, j += 2) {
-		const uint64_t D = 1ull << j;
-		const uint64_t* ro = R + (_Base >> (j + 1));
-		const uint64_t* ri = R + (_Base >> j);
-		if (_Base == 0) nat_asmINtt_radix4(D, M, B, ro, ri, E);
-		else nat_asmINtt2_radix4(D, M, B, ro, ri, E);
 	}
 }
 
